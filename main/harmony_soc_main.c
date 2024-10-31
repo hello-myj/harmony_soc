@@ -42,6 +42,8 @@ void app_main(void)
     hal_wifi_sta_init();
 
     hal_ble_init();
+    hal_ble_set_connect_devname("Xiaomi 12S");
+    // hal_ble_set_connect_devname("Xiaom22222");
 
     app_proc_start();
 }

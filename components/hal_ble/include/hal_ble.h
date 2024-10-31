@@ -5,16 +5,15 @@
 
 enum
 {
-    HAL_BLE_STATUS_NONE,
-    HAL_BLE_STATUS_NOTHING,
-    HAL_BLE_STATUS_SCANNING,
+    HAL_BLE_STATUS_DISCONNECTED=0,
+    HAL_BLE_STATUS_CONNECTING,
     HAL_BLE_STATUS_CONNECTED,
 };
 
 int hal_ble_init(void);
-int hal_ble_scan_start();
-int hal_ble_scan_stop();
-int hal_ble_connect(char *adv_name);
+int hal_ble_set_connect_devname(char *adv_name);
+int hal_ble_del_connect_devname(char *adv_name);
+
 
 #endif
 

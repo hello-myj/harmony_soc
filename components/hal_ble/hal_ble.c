@@ -1,366 +1,483 @@
 #include <stdio.h>
+#include <stdint.h>
+#include <string.h>
 #include "hal_ble.h"
 
+#include "esp_bt.h"
+#include "esp_gap_ble_api.h"
+#include "esp_gattc_api.h"
+#include "esp_gatt_defs.h"
+#include "esp_bt_main.h"
+#include "esp_gatt_common_api.h"
 #include "esp_log.h"
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
-#include "host/ble_hs.h"
-#include "host/util/util.h"
-#include "console/console.h"
-#include "services/gap/ble_svc_gap.h"
+#include "freertos/FreeRTOS.h"
 
-#include "esp_central.h"
+#include "ezos.h"
 
-uint8_t g_ble_master_status = HAL_BLE_STATUS_NONE;
-extern void ble_store_config_init(void);
+#define GATTC_TAG "BLE"
 
-static const char *tag = "BLE";
+static esp_ble_ext_scan_params_t ext_scan_params = {
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+    .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE,
+    .cfg_mask = ESP_BLE_GAP_EXT_SCAN_CFG_UNCODE_MASK | ESP_BLE_GAP_EXT_SCAN_CFG_CODE_MASK,
+    .uncoded_cfg = {BLE_SCAN_TYPE_ACTIVE, 40, 40},
+    .coded_cfg = {BLE_SCAN_TYPE_ACTIVE, 40, 40},
+};
 
-#if MYNEWT_VAL(BLE_L2CAP_COC_MAX_NUM) < 1
-static void
-blecent_on_disc_complete(const struct peer *peer, int status, void *arg)
+const esp_ble_gap_conn_params_t phy_1m_conn_params = {
+    .scan_interval = 0x40,
+    .scan_window = 0x40,
+    .interval_min = 320,
+    .interval_max = 320,
+    .latency = 0,
+    .supervision_timeout = 600,
+    .min_ce_len = 0,
+    .max_ce_len = 0,
+};
+const esp_ble_gap_conn_params_t phy_2m_conn_params = {
+    .scan_interval = 0x40,
+    .scan_window = 0x40,
+    .interval_min = 320,
+    .interval_max = 320,
+    .latency = 0,
+    .supervision_timeout = 600,
+    .min_ce_len = 0,
+    .max_ce_len = 0,
+};
+const esp_ble_gap_conn_params_t phy_coded_conn_params = {
+    .scan_interval = 0x40,
+    .scan_window = 0x40,
+    .interval_min = 320, // 306-> 362Kbps
+    .interval_max = 320,
+    .latency = 0,
+    .supervision_timeout = 600,
+    .min_ce_len = 0,
+    .max_ce_len = 0,
+};
+
+static uint16_t g_gattc_if = ESP_GATT_IF_NONE;
+
+#define HAL_MASTER_CONNECT_MAX 2
+
+#define REMOTE_SERVICE_UUID 0x00FF
+static esp_bt_uuid_t g_remote_filter_service_uuid = {
+    .len = ESP_UUID_LEN_16,
+    .uuid = {
+        .uuid16 = REMOTE_SERVICE_UUID,
+    },
+};
+
+typedef struct
 {
+    char adv_name[32];
+    uint8_t isfull;
+    uint8_t isConnect;
+    esp_bd_addr_t record_addr;
+    uint16_t conn_id;
+    uint8_t con_status;
+} ble_connect_remote_dev_t;
 
-    if (status != 0)
-    {
-        /* Service discovery failed.  Terminate the connection. */
-        MODLOG_DFLT(ERROR, "Error: Service discovery failed; status=%d "
-                           "conn_handle=%d\n",
-                    status, peer->conn_handle);
-        ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        return;
-    }
+ble_connect_remote_dev_t g_remote_tabs[HAL_MASTER_CONNECT_MAX] = {0};
 
-    /* Service discovery has completed successfully.  Now we have a complete
-     * list of services, characteristics, and descriptors that the peer
-     * supports.
-     */
-    MODLOG_DFLT(INFO, "Service discovery complete; status=%d "
-                      "conn_handle=%d\n",
-                status, peer->conn_handle);
-
-    /* Now user can perform GATT procedures against the peer: read,
-     * write, and subscribe to notifications.
-     */
-}
-#endif
-
-static int
-blecent_gap_event(struct ble_gap_event *event, void *arg)
+static void ble_scan_start_switch(uint8_t OnOff);
+static int hal_ble_set_status(char *dev_name, uint8_t status);
+static int hal_ble_set_status_by_addr(esp_bd_addr_t addr, uint8_t status);
+static int hal_ble_get_status(char *dev_name, uint8_t *status);
+static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
-    struct ble_gap_conn_desc desc;
-    struct ble_hs_adv_fields fields;
-#if MYNEWT_VAL(BLE_HCI_VS)
-#if MYNEWT_VAL(BLE_POWER_CONTROL)
-    struct ble_gap_set_auto_pcl_params params;
-#endif
-#endif
-    int rc;
-
-    switch (event->type)
+    switch (event)
     {
-    case BLE_GAP_EVENT_DISC:
-        rc = ble_hs_adv_parse_fields(&fields, event->disc.data,
-                                     event->disc.length_data);
-        if (rc != 0)
+    case ESP_GAP_BLE_EXT_ADV_REPORT_EVT:
+    {
+        uint8_t *adv_name = NULL;
+        uint8_t adv_name_len = 0;
+
+        adv_name = esp_ble_resolve_adv_data_by_type(param->ext_adv_report.params.adv_data,
+                                                    param->ext_adv_report.params.adv_data_len,
+                                                    ESP_BLE_AD_TYPE_NAME_CMPL,
+                                                    &adv_name_len);
+
+        for (int i = 0; i < HAL_MASTER_CONNECT_MAX; i++)
         {
-            return 0;
+            if (g_remote_tabs[i].isfull == 1)
+            {
+                if (strlen(g_remote_tabs[i].adv_name) == adv_name_len && strncmp((char *)adv_name, g_remote_tabs[i].adv_name, adv_name_len) == 0)
+                {
+                    esp_ble_gap_prefer_ext_connect_params_set(param->ext_adv_report.params.addr,
+                                                              ESP_BLE_GAP_PHY_1M_PREF_MASK | ESP_BLE_GAP_PHY_2M_PREF_MASK | ESP_BLE_GAP_PHY_CODED_PREF_MASK,
+                                                              &phy_1m_conn_params, &phy_2m_conn_params, &phy_coded_conn_params);
+                    memcpy(&g_remote_tabs[i].record_addr, &param->ext_adv_report.params.addr, sizeof(esp_bd_addr_t));
+                    ESP_LOGI(GATTC_TAG, "find adv device %s\r\n", g_remote_tabs[i].adv_name);
+                    uint8_t status = 0;
+                    int ret = hal_ble_get_status(g_remote_tabs[i].adv_name, &status);
+                    if (ret != 0)
+                    {
+                        break;
+                    }
+
+                    if (status == HAL_BLE_STATUS_CONNECTED)
+                    {
+                        break;
+                    }
+
+                    ret = hal_ble_set_status(g_remote_tabs[i].adv_name, HAL_BLE_STATUS_CONNECTING);
+                    if (ret != 0)
+                    {
+                        ESP_LOGE(GATTC_TAG, "set status error ");
+                        break;
+                    }
+                    ble_scan_start_switch(0);
+
+                    esp_ble_gattc_aux_open(g_gattc_if,
+                                           param->ext_adv_report.params.addr,
+                                           param->ext_adv_report.params.addr_type, true);
+                    break;
+                }
+            }
         }
-
-        /* An advertisement report was received during GAP discovery. */
-        print_adv_fields(&fields);
-
-        /* Try to connect to the advertiser if it looks interesting. */
-        // blecent_connect_if_interesting(&event->disc);
-        return 0;
-
-    case BLE_GAP_EVENT_LINK_ESTAB:
-        /* A new connection was established or a connection attempt failed. */
-        if (event->connect.status == 0)
+    }
+    break;
+    case ESP_GAP_BLE_EXT_SCAN_START_COMPLETE_EVT:
+        if (param->ext_scan_start.status != ESP_BT_STATUS_SUCCESS)
         {
-            /* Connection successfully established. */
-            MODLOG_DFLT(INFO, "Connection established ");
+            ESP_LOGE(GATTC_TAG, "Extended scanning start failed, status %x", param->ext_scan_start.status);
+            break;
+        }
+        ESP_LOGI(GATTC_TAG, "Extended scanning start successfully");
+        break;
+    case ESP_GAP_BLE_EXT_SCAN_STOP_COMPLETE_EVT:
+        if (param->ext_scan_stop.status != ESP_BT_STATUS_SUCCESS)
+        {
+            ESP_LOGE(GATTC_TAG, "Scanning stop failed, status %x", param->ext_scan_stop.status);
+            break;
+        }
+        ESP_LOGI(GATTC_TAG, "Scanning stop successfully");
+        break;
+    default:
+        break;
+    }
+}
 
-            rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
-            assert(rc == 0);
-            print_conn_desc(&desc);
-            MODLOG_DFLT(INFO, "\n");
+static void esp_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param)
+{
+    esp_ble_gattc_cb_param_t *p_data = (esp_ble_gattc_cb_param_t *)param;
+    switch (event)
+    {
+    case ESP_GATTC_REG_EVT:
+        g_gattc_if = gattc_if;
+        esp_ble_gap_config_local_privacy(true);
+        break;
 
-            /* Remember peer. */
-            rc = peer_add(event->connect.conn_handle);
-            if (rc != 0)
-            {
-                MODLOG_DFLT(ERROR, "Failed to add peer; rc=%d\n", rc);
-                return 0;
-            }
+    case ESP_GATTC_CONNECT_EVT:
+        ESP_LOGI(GATTC_TAG, "Connected, conn_id %d, remote " ESP_BD_ADDR_STR "", p_data->connect.conn_id,
+                 ESP_BD_ADDR_HEX(p_data->connect.remote_bda));
+        break;
+    case ESP_GATTC_OPEN_EVT:
+        if (param->open.status != ESP_GATT_OK)
+        {
+            ESP_LOGE(GATTC_TAG, "Open failed, status %x", p_data->open.status);
+            break;
+        }
+        ESP_LOGI(GATTC_TAG, "Open successfully, MTU %d", p_data->open.mtu);
+        // gl_profile_tab[PROFILE_A_APP_ID].conn_id = p_data->open.conn_id;
 
-#if MYNEWT_VAL(BLE_POWER_CONTROL)
-            blecent_power_control(event->connect.conn_handle);
-#endif
+        // memcpy(gl_profile_tab[PROFILE_A_APP_ID].remote_bda, p_data->open.remote_bda, sizeof(esp_bd_addr_t));
 
-#if MYNEWT_VAL(BLE_HCI_VS)
-#if MYNEWT_VAL(BLE_POWER_CONTROL)
-            memset(&params, 0x0, sizeof(struct ble_gap_set_auto_pcl_params));
-            params.conn_handle = event->connect.conn_handle;
-            rc = ble_gap_set_auto_pcl_param(&params);
-            if (rc != 0)
-            {
-                MODLOG_DFLT(INFO, "Failed to send VSC  %x \n", rc);
-                return 0;
-            }
-            else
-            {
-                MODLOG_DFLT(INFO, "Successfully issued VSC , rc = %d \n", rc);
-            }
-#endif
-#endif
+        hal_ble_set_status_by_addr(p_data->open.remote_bda, HAL_BLE_STATUS_CONNECTED);
 
-#if CONFIG_EXAMPLE_ENCRYPTION
-            /** Initiate security - It will perform
-             * Pairing (Exchange keys)
-             * Bonding (Store keys)
-             * Encryption (Enable encryption)
-             * Will invoke event BLE_GAP_EVENT_ENC_CHANGE
-             **/
-            rc = ble_gap_security_initiate(event->connect.conn_handle);
-            if (rc != 0)
-            {
-                MODLOG_DFLT(INFO, "Security could not be initiated, rc = %d\n", rc);
-                return ble_gap_terminate(event->connect.conn_handle,
-                                         BLE_ERR_REM_USER_CONN_TERM);
-            }
-            else
-            {
-                MODLOG_DFLT(INFO, "Connection secured\n");
-            }
-#else
-            /* Perform service discovery */
-            rc = peer_disc_all(event->connect.conn_handle,
-                               blecent_on_disc_complete, NULL);
-            if (rc != 0)
-            {
-                MODLOG_DFLT(ERROR, "Failed to discover services; rc=%d\n", rc);
-                return 0;
-            }
-#endif
+        esp_err_t mtu_ret = esp_ble_gattc_send_mtu_req(gattc_if, p_data->open.conn_id);
+        if (mtu_ret)
+        {
+            ESP_LOGE(GATTC_TAG, "config MTU error, error code = %x", mtu_ret);
+        }
+        break;
+    case ESP_GATTC_CFG_MTU_EVT:
+        ESP_LOGI(GATTC_TAG, "MTU exchange, status %d, MTU %d, conn_id %d", param->cfg_mtu.status, param->cfg_mtu.mtu, param->cfg_mtu.conn_id);
+        break;
+    case ESP_GATTC_DIS_SRVC_CMPL_EVT:
+        if (param->dis_srvc_cmpl.status != ESP_GATT_OK)
+        {
+            ESP_LOGE(GATTC_TAG, "Service discover failed, status %d", param->dis_srvc_cmpl.status);
+            break;
+        }
+        ESP_LOGI(GATTC_TAG, "Service discover complete, conn_id %d", param->dis_srvc_cmpl.conn_id);
+        esp_ble_gattc_search_service(g_gattc_if, param->cfg_mtu.conn_id, &g_remote_filter_service_uuid);
+        break;
+    case ESP_GATTC_SEARCH_RES_EVT:
+    {
+        ESP_LOGI(GATTC_TAG, "Service search result, conn_id %x, is primary service %d", p_data->search_res.conn_id, p_data->search_res.is_primary);
+        ESP_LOGI(GATTC_TAG, "start handle %d end handle %d current handle value %d", p_data->search_res.start_handle, p_data->search_res.end_handle, p_data->search_res.srvc_id.inst_id);
+        // if (p_data->search_res.srvc_id.uuid.len == ESP_UUID_LEN_16 && p_data->search_res.srvc_id.uuid.uuid.uuid16 == REMOTE_SERVICE_UUID)
+        // {
+        //     ESP_LOGI(GATTC_TAG, "UUID16: %x", p_data->search_res.srvc_id.uuid.uuid.uuid16);
+        //     get_service = true;
+        //     gl_profile_tab[PROFILE_A_APP_ID].service_start_handle = p_data->search_res.start_handle;
+        //     gl_profile_tab[PROFILE_A_APP_ID].service_end_handle = p_data->search_res.end_handle;
+        // }
+        break;
+    }
+    case ESP_GATTC_SEARCH_CMPL_EVT:
+        if (p_data->search_cmpl.status != ESP_GATT_OK)
+        {
+            ESP_LOGE(GATTC_TAG, "Service search failed, status %x", p_data->search_cmpl.status);
+            break;
+        }
+        ESP_LOGI(GATTC_TAG, "Service search complete");
+        if (p_data->search_cmpl.searched_service_source == ESP_GATT_SERVICE_FROM_REMOTE_DEVICE)
+        {
+            ESP_LOGI(GATTC_TAG, "Get service information from remote device");
+        }
+        else if (p_data->search_cmpl.searched_service_source == ESP_GATT_SERVICE_FROM_NVS_FLASH)
+        {
+            ESP_LOGI(GATTC_TAG, "Get service information from flash");
         }
         else
         {
-            /* Connection attempt failed; resume scanning. */
-            MODLOG_DFLT(ERROR, "Error: Connection failed; status=%d\n",
-                        event->connect.status);
-            //blecent_scan();
+            ESP_LOGI(GATTC_TAG, "unknown service source");
         }
+        break;
 
-        return 0;
+    case ESP_GATTC_DISCONNECT_EVT:
+        ESP_LOGI(GATTC_TAG, "Disconnected, remote " ESP_BD_ADDR_STR ", reason 0x%02x",
+                 ESP_BD_ADDR_HEX(p_data->disconnect.remote_bda), p_data->disconnect.reason);
 
-    case BLE_GAP_EVENT_DISCONNECT:
-        /* Connection terminated. */
-        MODLOG_DFLT(INFO, "disconnect; reason=%d ", event->disconnect.reason);
-        print_conn_desc(&event->disconnect.conn);
-        MODLOG_DFLT(INFO, "\n");
+        hal_ble_set_status_by_addr(p_data->disconnect.remote_bda, HAL_BLE_STATUS_DISCONNECTED);
+        break;
+    default:
+        break;
+    }
+}
 
-        /* Forget about peer. */
-        peer_delete(event->disconnect.conn.conn_handle);
+int hal_ble_set_connect_devname(char *adv_name)
+{
+    if (adv_name == NULL)
+        return -1;
 
-        /* Resume scanning. */
-        blecent_scan();
-        return 0;
+    int adv_len = strlen(adv_name);
 
-    case BLE_GAP_EVENT_DISC_COMPLETE:
-        MODLOG_DFLT(INFO, "discovery complete; reason=%d\n",
-                    event->disc_complete.reason);
-        return 0;
-
-    case BLE_GAP_EVENT_ENC_CHANGE:
-        /* Encryption has been enabled or disabled for this connection. */
-        MODLOG_DFLT(INFO, "encryption change event; status=%d ",
-                    event->enc_change.status);
-        rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
-        assert(rc == 0);
-        print_conn_desc(&desc);
-#if CONFIG_EXAMPLE_ENCRYPTION
-        /*** Go for service discovery after encryption has been successfully enabled ***/
-        rc = peer_disc_all(event->connect.conn_handle,
-                           blecent_on_disc_complete, NULL);
-        if (rc != 0)
+    for (int i = 0; i < HAL_MASTER_CONNECT_MAX; i++)
+    {
+        // 先判断是否重复
+        if (g_remote_tabs[i].isfull == 1)
         {
-            MODLOG_DFLT(ERROR, "Failed to discover services; rc=%d\n", rc);
+            if (strcmp(adv_name, g_remote_tabs[i].adv_name) == 0)
+            {
+                return -1;
+            }
+        }
+    }
+
+    for (int i = 0; i < HAL_MASTER_CONNECT_MAX; i++)
+    {
+        if (g_remote_tabs[i].isfull == 0)
+        {
+            memcpy(g_remote_tabs[i].adv_name, adv_name, adv_len);
+            g_remote_tabs[i].isfull = 1;
             return 0;
         }
-#endif
-        return 0;
-
-    case BLE_GAP_EVENT_NOTIFY_RX:
-        /* Peer sent us a notification or indication. */
-        MODLOG_DFLT(INFO, "received %s; conn_handle=%d attr_handle=%d "
-                          "attr_len=%d\n",
-                    event->notify_rx.indication ? "indication" : "notification",
-                    event->notify_rx.conn_handle,
-                    event->notify_rx.attr_handle,
-                    OS_MBUF_PKTLEN(event->notify_rx.om));
-
-        /* Attribute data is contained in event->notify_rx.om. Use
-         * `os_mbuf_copydata` to copy the data received in notification mbuf */
-        return 0;
-
-    case BLE_GAP_EVENT_MTU:
-        MODLOG_DFLT(INFO, "mtu update event; conn_handle=%d cid=%d mtu=%d\n",
-                    event->mtu.conn_handle,
-                    event->mtu.channel_id,
-                    event->mtu.value);
-        return 0;
-
-    case BLE_GAP_EVENT_REPEAT_PAIRING:
-        /* We already have a bond with the peer, but it is attempting to
-         * establish a new secure link.  This app sacrifices security for
-         * convenience: just throw away the old bond and accept the new link.
-         */
-
-        /* Delete the old bond. */
-        rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
-        assert(rc == 0);
-        ble_store_util_delete_peer(&desc.peer_id_addr);
-
-        /* Return BLE_GAP_REPEAT_PAIRING_RETRY to indicate that the host should
-         * continue with the pairing operation.
-         */
-        return BLE_GAP_REPEAT_PAIRING_RETRY;
-
-#if CONFIG_EXAMPLE_EXTENDED_ADV
-    case BLE_GAP_EVENT_EXT_DISC:
-        /* An advertisement report was received during GAP discovery. */
-        ext_print_adv_report(&event->disc);
-
-        blecent_connect_if_interesting(&event->disc);
-        return 0;
-#endif
-
-#if MYNEWT_VAL(BLE_POWER_CONTROL)
-    case BLE_GAP_EVENT_TRANSMIT_POWER:
-        MODLOG_DFLT(INFO, "Transmit power event : status=%d conn_handle=%d reason=%d "
-                          "phy=%d power_level=%d power_level_flag=%d delta=%d",
-                    event->transmit_power.status,
-                    event->transmit_power.conn_handle,
-                    event->transmit_power.reason,
-                    event->transmit_power.phy,
-                    event->transmit_power.transmit_power_level,
-                    event->transmit_power.transmit_power_level_flag,
-                    event->transmit_power.delta);
-        return 0;
-
-    case BLE_GAP_EVENT_PATHLOSS_THRESHOLD:
-        MODLOG_DFLT(INFO, "Pathloss threshold event : conn_handle=%d current path loss=%d "
-                          "zone_entered =%d",
-                    event->pathloss_threshold.conn_handle,
-                    event->pathloss_threshold.current_path_loss,
-                    event->pathloss_threshold.zone_entered);
-        return 0;
-#endif
-    default:
-        return 0;
     }
+    return -1;
 }
-int hal_ble_scan_start()
-{
-    uint8_t own_addr_type;
-    struct ble_gap_disc_params disc_params;
-    int rc;
 
-    /* Figure out address to use while advertising (no privacy for now) */
-    rc = ble_hs_id_infer_auto(0, &own_addr_type);
-    if (rc != 0)
+int hal_ble_del_connect_devname(char *adv_name)
+{
+    if (adv_name == NULL)
+        return -1;
+    for (int i = 0; i < HAL_MASTER_CONNECT_MAX; i++)
     {
-        MODLOG_DFLT(ERROR, "error determining address type; rc=%d\n", rc);
-        return;
+        if (g_remote_tabs[i].isfull)
+        {
+            if (strcmp(adv_name, g_remote_tabs[i].adv_name) == 0)
+            {
+                g_remote_tabs[i].isfull = 0;
+                memset(g_remote_tabs[i].adv_name, 0, 32);
+                return 0;
+            }
+        }
     }
+    return -1;
+}
 
-    /* Tell the controller to filter duplicates; we don't want to process
-     * repeated advertisements from the same device.
-     */
-    disc_params.filter_duplicates = 1;
+static int hal_ble_set_status(char *dev_name, uint8_t status)
+{
+    if (dev_name == NULL)
+        return -1;
 
-    /**
-     * Perform a passive scan.  I.e., don't send follow-up scan requests to
-     * each advertiser.
-     */
-    disc_params.passive = 1;
-
-    /* Use defaults for the rest of the parameters. */
-    disc_params.itvl = 0;
-    disc_params.window = 0;
-    disc_params.filter_policy = 0;
-    disc_params.limited = 0;
-
-    rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params,
-                      blecent_gap_event, NULL);
-    if (rc != 0)
+    for (int i = 0; i < HAL_MASTER_CONNECT_MAX; i++)
     {
-        MODLOG_DFLT(ERROR, "Error initiating GAP discovery procedure; rc=%d\n",
-                    rc);
+        if (g_remote_tabs[i].isfull == 1)
+        {
+            if (strcmp(dev_name, g_remote_tabs[i].adv_name) == 0)
+            {
+
+                g_remote_tabs[i].con_status = status;
+                ESP_LOGW(GATTC_TAG, "set status %d", status);
+
+                return 0;
+            }
+        }
     }
 
-    return 0;
+    return -1;
 }
 
-int hal_ble_scan_stop()
+static int hal_ble_get_status(char *dev_name, uint8_t *status)
 {
+    if (dev_name == NULL)
+        return -1;
 
-    return 0;
+    for (int i = 0; i < HAL_MASTER_CONNECT_MAX; i++)
+    {
+        if (g_remote_tabs[i].isfull == 1)
+        {
+            if (strcmp(dev_name, g_remote_tabs[i].adv_name) == 0)
+            {
+                *status = g_remote_tabs[i].con_status;
+                ESP_LOGW(GATTC_TAG, "get status %d", *status);
+
+                return 0;
+            }
+        }
+    }
+
+    return -1;
 }
 
-int hal_ble_connect(char *adv_name)
+static int hal_ble_set_status_by_addr(esp_bd_addr_t addr, uint8_t status)
 {
 
-    return 0;
+    for (int i = 0; i < HAL_MASTER_CONNECT_MAX; i++)
+    {
+        // 先判断是否重复
+        if (g_remote_tabs[i].isfull == 1)
+        {
+            if (memcmp(addr, g_remote_tabs[i].record_addr, 6) == 0)
+            {
+
+                g_remote_tabs[i].con_status = status;
+                ESP_LOGW(GATTC_TAG, "set status %d", status);
+                return 0;
+            }
+        }
+    }
+
+    return -1;
 }
 
-static void blecent_on_sync(void)
+static void ble_scan_start_switch(uint8_t OnOff)
 {
-    int rc;
+    static uint8_t scan_start_flag = 0;
 
-    /* Make sure we have proper identity address set (public preferred) */
-    rc = ble_hs_util_ensure_addr(0);
-    assert(rc == 0);
-
-    /* Begin scanning for a peripheral to connect to. */
-    //   blecent_scan();
+    if (OnOff)
+    {
+        if (scan_start_flag == 0)
+        {
+            esp_ble_gap_start_ext_scan(0, 0);
+            scan_start_flag = 1;
+        }
+    }
+    else
+    {
+        if (scan_start_flag == 1)
+        {
+            esp_ble_gap_stop_ext_scan();
+            scan_start_flag = 0;
+        }
+    }
+    ESP_LOGI(GATTC_TAG, "scan_start_flag %d", scan_start_flag);
 }
 
-static void blecent_host_task(void *param)
+void hal_ble_func_check_timer_cb(void *arg)
 {
-    ESP_LOGI(tag, "BLE Host Task Started");
-    /* This function will return only when nimble_port_stop() is executed */
-    nimble_port_run();
+    uint8_t scan_flag = 0;
+    for (int i = 0; i < HAL_MASTER_CONNECT_MAX; i++)
+    {
+        if (g_remote_tabs[i].isfull)
+        {
+            if (g_remote_tabs[i].con_status == HAL_BLE_STATUS_CONNECTING)
+            {
+                scan_flag = 0;
+                break;
+            }
+            else if (g_remote_tabs[i].con_status == HAL_BLE_STATUS_DISCONNECTED)
+            {
+                scan_flag = 1;
+            }
+        }
+    }
 
-    nimble_port_freertos_deinit();
+    ble_scan_start_switch(scan_flag);
 }
 
 int hal_ble_init(void)
 {
-    int rc;
-    esp_err_t ret = nimble_port_init();
-    if (ret != ESP_OK)
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+    if (ret)
     {
-        ESP_LOGE(tag, "Failed to init nimble %d ", ret);
+        ESP_LOGE(GATTC_TAG, "%s initialize controller failed: %s", __func__, esp_err_to_name(ret));
         return -1;
     }
-    /* Configure the host. */
-    ble_hs_cfg.reset_cb = NULL;
-    ble_hs_cfg.sync_cb = blecent_on_sync;
-    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
-    rc = peer_init(MYNEWT_VAL(BLE_MAX_CONNECTIONS), 64, 64, 64);
-    assert(rc == 0);
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret)
+    {
+        ESP_LOGE(GATTC_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(ret));
+        return -1;
+    }
 
-    /* Set the default device name. */
-    rc = ble_svc_gap_device_name_set("nimble-blecent");
-    assert(rc == 0);
+    ret = esp_bluedroid_init();
+    if (ret)
+    {
+        ESP_LOGE(GATTC_TAG, "%s init bluetooth failed: %s", __func__, esp_err_to_name(ret));
+        return -1;
+    }
 
-    ble_store_config_init();
+    ret = esp_bluedroid_enable();
+    if (ret)
+    {
+        ESP_LOGE(GATTC_TAG, "%s enable bluetooth failed: %s", __func__, esp_err_to_name(ret));
+        return -1;
+    }
+    // register the  callback function to the gap module
+    ret = esp_ble_gap_register_callback(esp_gap_cb);
+    if (ret)
+    {
+        ESP_LOGE(GATTC_TAG, "%s gap register failed, error code = %x", __func__, ret);
+        return -1;
+    }
 
-    nimble_port_freertos_init(blecent_host_task);
+    // register the callback function to the gattc module
+    ret = esp_ble_gattc_register_callback(esp_gattc_cb);
+    if (ret)
+    {
+        ESP_LOGE(GATTC_TAG, "%s gattc register failed, error code = %x", __func__, ret);
+        return -1;
+    }
 
-    g_ble_master_status = HAL_BLE_STATUS_NOTHING;
+    ret = esp_ble_gattc_app_register(0);
+    if (ret)
+    {
+        ESP_LOGE(GATTC_TAG, "%s gattc app register failed, error code = %x", __func__, ret);
+    }
+    ret = esp_ble_gatt_set_local_mtu(500);
+    if (ret)
+    {
+        ESP_LOGE(GATTC_TAG, "set local  MTU failed, error code = %x", ret);
+    }
+
+    ret = esp_ble_gap_set_ext_scan_params(&ext_scan_params);
+    if (ret)
+    {
+        ESP_LOGE(GATTC_TAG, "Set extend scan params error, error code = %x", ret);
+    }
+
+    ;
+
+    ezos_timer_start(ezos_timer_create(hal_ble_func_check_timer_cb, 0, 1), 100);
+
     return 0;
 }
